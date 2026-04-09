@@ -1,0 +1,925 @@
+# Copyright (c) 2012-2017 Ben Croston <ben@croston.org>.
+# Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2021-2023, Texas Instruments Incorporated. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+from TI.GPIO import gpio_pin_data
+import TI.GPIO as GPIO
+import os
+import time
+import warnings
+import threading
+
+try:
+    import thread
+except:
+    import _thread as thread
+
+
+from datetime import timedelta
+from collections import defaultdict
+
+import gpiod
+from gpiod.line import Direction, Value, Edge
+
+# Pin Numbering Modes
+BOARD = 10
+BCM = 11
+SOC = 1000
+
+# The constants and their offsets are implemented to prevent HIGH from being
+# used in place of other variables (ie. HIGH and RISING should not be
+# interchangeable)
+
+# Pull up/down options
+_PUD_OFFSET = 20
+PUD_OFF = 0 + _PUD_OFFSET
+PUD_DOWN = 1 + _PUD_OFFSET
+PUD_UP = 2 + _PUD_OFFSET
+
+HIGH = 1
+LOW = 0
+
+# Edge possibilities
+# These values (with _EDGE_OFFSET subtracted) must match gpio_event.py:*_EDGE
+_EDGE_OFFSET = 30
+RISING = 1 + _EDGE_OFFSET
+FALLING = 2 + _EDGE_OFFSET
+BOTH = 3 + _EDGE_OFFSET
+
+# GPIO directions. UNKNOWN constant is for gpios that are not yet setup
+UNKNOWN = -1
+OUT = 0
+IN = 1
+SERIAL = 40
+SPI = 41
+I2C = 42
+HARD_PWM = 43
+
+model, BOARD_INFO, _channel_data_by_mode = gpio_pin_data.get_data()
+RPI_INFO = BOARD_INFO
+
+# Dictionary objects used as lookup tables for pin to linux gpio mapping
+_channel_data = {}
+
+_sw_pwm_channels = {}
+
+_gpio_warnings = True
+_gpio_mode = None
+_channel_configuration = {}
+
+# GPIOD variables
+MAX_EVENTS = 64
+line_request = None
+channelLineRequest = defaultdict(lambda: None)
+eventCallbacks = defaultdict(list)
+
+
+def _validate_mode_set():
+    if _gpio_mode is None:
+        raise RuntimeError(
+            "Please set pin numbering mode using "
+            "GPIO.setmode(GPIO.BOARD), GPIO.setmode(GPIO.BCM), "
+            "GPIO.setmode(GPIO.SOC)"
+        )
+
+
+def _make_iterable(iterable, single_length=None):
+    if isinstance(iterable, str):
+        iterable = [iterable]
+    try:
+        for x in iterable:
+            break
+    except:
+        iterable = [iterable]
+    if single_length is not None and len(iterable) == 1:
+        iterable = iterable * single_length
+    return iterable
+
+
+def _channel_to_info_lookup(channel, need_gpio, need_pwm):
+    if channel not in _channel_data:
+        raise ValueError("Channel %s is invalid" % str(channel))
+    ch_info = _channel_data[channel]
+    if need_pwm and ch_info.pwm_chip_dir is None:
+        raise ValueError("Channel %s is not a PWM" % str(channel))
+    return ch_info
+
+
+def _channel_to_info(channel, need_gpio=False, need_pwm=False):
+    _validate_mode_set()
+    return _channel_to_info_lookup(channel, need_gpio, need_pwm)
+
+
+def _channels_to_infos(channels, need_gpio=False, need_pwm=False):
+    _validate_mode_set()
+    return [
+        _channel_to_info_lookup(c, need_gpio, need_pwm)
+        for c in _make_iterable(channels)
+    ]
+
+
+def channel_configuration(ch_info):
+    """Return the current configuration of a channel as reported by sysfs. Any
+    of IN, OUT, PWM, or None may be returned."""
+    channel_direction = Direction.AS_IS
+
+    if ch_info.pwm_chip_dir is not None:
+        pwm_dir = "%s/pwm%i" % (ch_info.pwm_chip_dir, ch_info.pwm_id)
+        if os.path.exists(pwm_dir):
+            return HARD_PWM
+    else:
+        chip_path = "/dev/gpiochip" + str(ch_info.gpiochip)
+        with gpiod.Chip(chip_path) as chip:
+            info = chip.get_line_info(ch_info.gpio)
+            channel_direction = info.direction
+
+    if channel_direction == Direction.INPUT:
+        return IN
+    elif channel_direction == Direction.OUTPUT:
+        return OUT
+    else:
+        return None
+
+
+def _app_channel_configuration(ch_info):
+    """Return the current configuration of a channel as requested by this
+    module in this process. Any of IN, OUT, or None may be returned."""
+
+    return _channel_configuration.get(ch_info.channel, None)
+
+
+def _reconfigure_lines(line_request, ch_info, direction, initial):
+    gpiod_direction = Direction.AS_IS
+    gpiod_value = Value.INACTIVE
+
+    if direction == OUT:
+        gpiod_direction = Direction.OUTPUT
+        if initial == HIGH:
+            gpiod_value = Value.ACTIVE
+
+    else:
+        gpiod_direction = Direction.INPUT
+
+    line_request.reconfigure_lines(
+        config={
+            ch_info.gpio: gpiod.LineSettings(
+                direction=gpiod_direction, output_value=gpiod_value
+            )
+        }
+    )
+    _channel_configuration[ch_info.channel] = direction
+
+
+def _setup_single_out(ch_info, initial=None):
+    chip_path = "/dev/gpiochip" + str(ch_info.gpiochip)
+    gpiod_val = Value.INACTIVE
+
+    if initial == HIGH:
+        gpiod_val = Value.ACTIVE
+
+    line_request = gpiod.request_lines(
+        chip_path,
+        consumer=None,
+        config={
+            ch_info.gpio: gpiod.LineSettings(
+                direction=Direction.OUTPUT, output_value=gpiod_val
+            )
+        },
+    )
+
+    channelLineRequest[ch_info.gpio] = line_request
+    _channel_configuration[ch_info.channel] = OUT
+
+
+def _setup_single_in(ch_info):
+    chip_path = "/dev/gpiochip" + str(ch_info.gpiochip)
+    line_request = gpiod.request_lines(
+        chip_path,
+        consumer=None,
+        config={ch_info.gpio: gpiod.LineSettings(direction=Direction.INPUT)},
+    )
+
+    channelLineRequest[ch_info.gpio] = line_request
+    _channel_configuration[ch_info.channel] = IN
+
+
+def callback_handler(channel):
+    ch_info = _channel_to_info(channel, need_gpio=True)
+    while _run_loop:
+        noEvents = channelLineRequest[ch_info.gpio].read_edge_events(MAX_EVENTS)
+
+        for event in noEvents:
+            for callback in eventCallbacks[ch_info.gpio]:
+                callback(channel)
+
+
+def start_thread(channel):
+    global _run_loop
+    _run_loop = True
+    thread.start_new_thread(callback_handler, (channel,))
+
+
+def stop_thread():
+    _run_loop = False
+
+
+def event_cleanup(ch_info):
+    stop_thread()
+    eventCallbacks[ch_info.gpio].clear()
+
+
+def _pwm_path(ch_info):
+    return ch_info.pwm_chip_dir + "/pwm" + str(ch_info.pwm_id)
+
+
+def _pwm_export_path(ch_info):
+    return ch_info.pwm_chip_dir + "/export"
+
+
+def _pwm_unexport_path(ch_info):
+    return ch_info.pwm_chip_dir + "/unexport"
+
+
+def _pwm_period_path(ch_info):
+    return _pwm_path(ch_info) + "/period"
+
+
+def _pwm_duty_cycle_path(ch_info):
+    return _pwm_path(ch_info) + "/duty_cycle"
+
+
+def _pwm_enable_path(ch_info):
+    return _pwm_path(ch_info) + "/enable"
+
+
+def _export_pwm(ch_info):
+    if not os.path.exists(_pwm_path(ch_info)):
+        with open(_pwm_export_path(ch_info), "w") as f:
+            f.write(str(ch_info.pwm_id))
+
+    enable_path = _pwm_enable_path(ch_info)
+    while not os.access(enable_path, os.R_OK | os.W_OK):
+        time.sleep(0.01)
+
+    ch_info.f_duty_cycle = open(_pwm_duty_cycle_path(ch_info), "r+")
+
+
+def _unexport_pwm(ch_info):
+    ch_info.f_duty_cycle.close()
+
+    with open(_pwm_unexport_path(ch_info), "w") as f:
+        f.write(str(ch_info.pwm_id))
+
+
+def _set_pwm_period(ch_info, period_ns):
+    with open(_pwm_period_path(ch_info), "w") as f:
+        f.write(str(period_ns))
+
+
+def _set_pwm_duty_cycle(ch_info, duty_cycle_ns):
+    # On boot, both period and duty cycle are both 0. In this state, the period
+    # must be set first; any configuration change made while period==0 is
+    # rejected. This is fine if we actually want a duty cycle of 0. Later, once
+    # any period has been set, we will always be able to set a duty cycle of 0.
+    # The code could be written to always read the current value, and only
+    # write the value if the desired value is different. However, we enable
+    # this check only for the 0 duty cycle case, to avoid having to read the
+    # current value every time the duty cycle is set.
+    if not duty_cycle_ns:
+        ch_info.f_duty_cycle.seek(0)
+        cur = ch_info.f_duty_cycle.read().strip()
+        if cur == "0":
+            return
+
+    ch_info.f_duty_cycle.seek(0)
+    ch_info.f_duty_cycle.write(str(duty_cycle_ns))
+    ch_info.f_duty_cycle.flush()
+
+
+def _enable_pwm(ch_info):
+    with open(_pwm_enable_path(ch_info), "w") as f:
+        f.write("1")
+
+
+def _disable_pwm(ch_info):
+    with open(_pwm_enable_path(ch_info), "w") as f:
+        f.write("0")
+
+
+def _cleanup_one(ch_info):
+    app_cfg = _channel_configuration[ch_info.channel]
+    if app_cfg == HARD_PWM:
+        _disable_pwm(ch_info)
+        _unexport_pwm(ch_info)
+    else:
+        event_cleanup(ch_info)
+
+    del _channel_configuration[ch_info.channel]
+
+
+def _cleanup_all():
+    global _gpio_mode
+
+    _sw_pwm_channels.clear()
+    for channel in list(_channel_configuration.keys()):
+        ch_info = _channel_to_info(channel)
+        _cleanup_one(ch_info)
+
+    _gpio_mode = None
+
+
+# Function used to enable/disable warnings during setup and cleanup.
+# Param -> state is a bool
+def setwarnings(state):
+    global _gpio_warnings
+    _gpio_warnings = bool(state)
+
+
+# Function used to set the pin mumbering mode. Possible mode values are BOARD,
+# BCM, and SOC
+def setmode(mode):
+    global _gpio_mode, _channel_data
+
+    # check if a different mode has been set
+    if _gpio_mode and mode != _gpio_mode:
+        raise ValueError("A different mode has already been set!")
+
+    mode_map = {
+        BOARD: "BOARD",
+        BCM: "BCM",
+        SOC: "SOC",
+    }
+
+    # check if mode parameter is valid
+    if mode not in mode_map:
+        raise ValueError("An invalid mode was passed to setmode()!")
+
+    _channel_data = _channel_data_by_mode[mode_map[mode]]
+    _gpio_mode = mode
+
+
+# Function used to get the currently set pin numbering mode
+def getmode():
+    return _gpio_mode
+
+
+# Mutable class to represent a default function argument.
+# See https://stackoverflow.com/a/57628817/2767322
+class _Default:
+    def __init__(self, val):
+        self.val = val
+
+
+# Function used to setup individual pins or lists/tuples of pins as
+# Input or Output. Param channels must an integer or list/tuple of integers,
+# direction must be IN or OUT, pull_up_down must be PUD_OFF, PUD_UP or
+# PUD_DOWN and is only valid when direction in IN, initial must be HIGH or LOW
+# and is only valid when direction is OUT
+def setup(channels, direction, pull_up_down=_Default(PUD_OFF), initial=None):
+    if pull_up_down in setup.__defaults__:
+        pull_up_down_explicit = False
+        pull_up_down = pull_up_down.val
+    else:
+        pull_up_down_explicit = True
+
+    # Check if any of the channels is running as a PWM channel
+    for c in _make_iterable(channels):
+        if c in _sw_pwm_channels:
+            raise ValueError("Channel %d already running as a PWM channel" % (c))
+
+    ch_infos = _channels_to_infos(channels, need_gpio=True)
+
+    # check direction is valid
+    if direction != OUT and direction != IN:
+        raise ValueError("An invalid direction was passed to setup()")
+
+    # check if pullup/down is used with output
+    if direction == OUT and pull_up_down != PUD_OFF:
+        raise ValueError("pull_up_down parameter is not valid for outputs")
+
+    # check if pullup/down value is specified and/or valid
+    if pull_up_down_explicit:
+        warnings.warn("TI.GPIO ignores setup()'s pull_up_down parameter")
+    if pull_up_down != PUD_OFF and pull_up_down != PUD_UP and pull_up_down != PUD_DOWN:
+        raise ValueError(
+            "Invalid value for pull_up_down; should be one of"
+            "PUD_OFF, PUD_UP or PUD_DOWN"
+        )
+
+    if _gpio_warnings:
+        for ch_info in ch_infos:
+            gpiod_cfg = channel_configuration(ch_info)
+            app_cfg = _app_channel_configuration(ch_info)
+            # warn if channel has been setup external to current program
+            if app_cfg is not None and gpiod_cfg is not None:
+                warnings.warn(
+                    "This channel is already in use, continuing anyway. "
+                    "Use GPIO.setwarnings(False) to disable warnings",
+                    RuntimeWarning,
+                )
+
+    for ch_info in ch_infos:
+        if channelLineRequest[ch_info.gpio] is not None:
+            _reconfigure_lines(
+                channelLineRequest[ch_info.gpio], ch_info, direction, initial
+            )
+
+        elif direction == OUT:
+            _setup_single_out(ch_info, initial)
+
+        else:
+            if initial is not None:
+                raise ValueError("initial parameter is not valid for inputs")
+            _setup_single_in(ch_info)
+
+
+# Function used to cleanup channels at the end of the program.
+# The param channel can be an integer or list/tuple of integers specifying the
+# channels to be cleaned up. If no channel is provided, all channels are
+# cleaned
+def cleanup(channel=None):
+    # warn if no channel is setup
+    if _gpio_mode is None:
+        if _gpio_warnings:
+            warnings.warn(
+                "No channels have been set up yet - nothing to "
+                "clean up! Try cleaning up at the end of your "
+                "program instead!",
+                RuntimeWarning,
+            )
+        return
+
+    # clean all channels if no channel param provided
+    if channel is None:
+        _cleanup_all()
+        return
+
+    ch_infos = _channels_to_infos(channel)
+    for ch_info in ch_infos:
+        if ch_info.channel in _channel_configuration:
+            _cleanup_one(ch_info)
+
+
+# Function used to return the current value of the specified channel.
+# Function returns either HIGH or LOW
+def input(channel):
+    ch_info = _channel_to_info(channel, need_gpio=True)
+
+    app_cfg = _app_channel_configuration(ch_info)
+    if app_cfg not in [IN, OUT]:
+        raise RuntimeError("You must setup() the GPIO channel first")
+
+    value_read = channelLineRequest[ch_info.gpio].get_value(ch_info.gpio)
+    if value_read == Value.ACTIVE:
+        return HIGH
+    else:
+        return LOW
+
+
+# Function used to set a value to a channel or list/tuple of channels.
+# Parameter channels must be an integer or list/tuple of integers.
+# Values must be either HIGH or LOW or list/tuple
+# of HIGH and LOW with the same length as the channels list/tuple
+def output(channels, values):
+    ch_infos = _channels_to_infos(channels, need_gpio=True)
+    values = _make_iterable(values, len(ch_infos))
+    if len(values) != len(ch_infos):
+        raise RuntimeError("Number of values != number of channels")
+
+    # check that channels have been set as output
+    if any(_app_channel_configuration(ch_info) != OUT for ch_info in ch_infos):
+        raise RuntimeError("The GPIO channel has not been set up as an " "OUTPUT")
+
+    for ch_info, value in zip(ch_infos, values):
+        if value == HIGH:
+            channelLineRequest[ch_info.gpio].set_value(ch_info.gpio, Value.ACTIVE)
+        else:
+            channelLineRequest[ch_info.gpio].set_value(ch_info.gpio, Value.INACTIVE)
+
+
+# Function used to check if an event occurred on the specified channel.
+# Param channel must be an integer.
+# This function return True or False
+def event_detected(channel):
+    ch_info = _channel_to_info(channel, need_gpio=True)
+
+    if _app_channel_configuration(ch_info) != IN:
+        raise RuntimeError("You must setup() the GPIO channel as an " "input first")
+
+    noEvents = 0
+    noEvents = len(channelLineRequest[ch_info.gpio].read_edge_events(MAX_EVENTS))
+    return noEvents
+
+
+# Function used to add a callback function to channel, after it has been
+# registered for events using add_event_detect()
+def add_event_callback(channel, callback):
+    ch_info = _channel_to_info(channel, need_gpio=True)
+    if not callable(callback):
+        raise TypeError("Parameter must be callable")
+
+    if _app_channel_configuration(ch_info) != IN:
+        raise RuntimeError("You must setup() the GPIO channel as an " "input first")
+
+    with gpiod.Chip("/dev/gpiochip" + str(ch_info.gpiochip)) as chip:
+        info = chip.get_line_info(ch_info.gpio)
+        if info.edge_detection == Edge.NONE:
+            raise RuntimeError(
+                "Add event detection using add_event_detect first "
+                "before adding a callback"
+            )
+
+    eventCallbacks[ch_info.gpio].append(callback)
+
+
+# Function used to add threaded event detection for a specified gpio channel.
+# Param gpio must be an integer specifying the channel, edge must be RISING,
+# FALLING or BOTH. A callback function to be called when the event is detected
+# and an integer bounctime in milliseconds can be optionally provided
+def add_event_detect(channel, edge, callback=None, bouncetime=None):
+    ch_info = _channel_to_info(channel, need_gpio=True)
+    if (not callable(callback)) and callback is not None:
+        raise TypeError("Callback Parameter must be callable")
+
+    # channel must be setup as input
+    if _app_channel_configuration(ch_info) != IN:
+        raise RuntimeError("You must setup() the GPIO channel as an input " "first")
+
+    # edge must be rising, falling or both
+    if edge != RISING and edge != FALLING and edge != BOTH:
+        raise ValueError("The edge must be set to RISING, FALLING, or BOTH")
+
+    # if bouncetime is provided, it must be int and greater than 0
+    if bouncetime is not None:
+        if type(bouncetime) != int:
+            raise TypeError("bouncetime must be an integer")
+
+        elif bouncetime < 0:
+            raise ValueError("bouncetime must be an integer greater than 0")
+
+    gpiod_edge = Edge.NONE
+    if edge == RISING:
+        gpiod_edge = Edge.RISING
+    elif edge == FALLING:
+        gpiod_edge = Edge.FALLING
+    else:
+        gpiod_edge = Edge.BOTH
+
+    if bouncetime != None:
+        channelLineRequest[ch_info.gpio].reconfigure_lines(
+            config={
+                ch_info.gpio: gpiod.LineSettings(
+                    edge_detection=gpiod_edge,
+                    debounce_period=timedelta(milliseconds=bouncetime),
+                )
+            }
+        )
+    else:
+        channelLineRequest[ch_info.gpio].reconfigure_lines(
+            config={
+                ch_info.gpio: gpiod.LineSettings(
+                    edge_detection=gpiod_edge,
+                    debounce_period=timedelta(),
+                )
+            }
+        )
+
+    if callback is not None:
+        add_event_callback(channel, callback)
+
+    start_thread(channel)
+
+
+# Function used to remove event detection for channel
+def remove_event_detect(channel):
+    ch_info = _channel_to_info(channel, need_gpio=True)
+    eventCallbacks[ch_info.gpio].clear()
+
+
+# Function used to perform a blocking wait until the specified edge
+# is detected for the param channel. Channel must be an integer and edge must
+# be either RISING, FALLING or BOTH.
+# bouncetime in milliseconds and timeout in millseconds can optionally be
+# provided
+def wait_for_edge(channel, edge, bouncetime=None, timeout=None):
+    ch_info = _channel_to_info(channel, need_gpio=True)
+
+    # channel must be setup as input
+    if _app_channel_configuration(ch_info) != IN:
+        raise RuntimeError("You must setup() the GPIO channel as an input " "first")
+
+    # edge provided must be rising, falling or both
+    if edge != RISING and edge != FALLING and edge != BOTH:
+        raise ValueError("The edge must be set to RISING, FALLING_EDGE " "or BOTH")
+
+    # if bouncetime is provided, it must be int and greater than 0
+    if bouncetime is not None:
+        if type(bouncetime) != int:
+            raise TypeError("bouncetime must be an integer")
+
+        elif bouncetime < 0:
+            raise ValueError("bouncetime must be an integer greater than 0")
+
+    # if timeout is specified, it must be an int and greater than 0
+    if timeout is not None:
+        if type(timeout) != int:
+            raise TypeError("Timeout must be an integer")
+
+        elif timeout < 0:
+            raise ValueError("Timeout must greater than 0")
+
+    gpiod_edge = Edge.NONE
+    if edge == RISING:
+        gpiod_edge = Edge.RISING
+    elif edge == FALLING:
+        gpiod_edge = Edge.FALLING
+    else:
+        gpiod_edge = Edge.BOTH
+
+    if bouncetime != None:
+        channelLineRequest[ch_info.gpio].reconfigure_lines(
+            config={
+                ch_info.gpio: gpiod.LineSettings(
+                    edge_detection=gpiod_edge,
+                    debounce_period=timedelta(milliseconds=bouncetime),
+                )
+            }
+        )
+    else:
+        channelLineRequest[ch_info.gpio].reconfigure_lines(
+            config={
+                ch_info.gpio: gpiod.LineSettings(
+                    edge_detection=gpiod_edge,
+                    debounce_period=timedelta(),
+                )
+            }
+        )
+
+    if timeout != None:
+        status = channelLineRequest[ch_info.gpio].wait_edge_events(
+            timedelta(milliseconds=timeout)
+        )
+    else:
+        status = channelLineRequest[ch_info.gpio].wait_edge_events(None)
+
+    if status == True:
+        noEvents = channelLineRequest[ch_info.gpio].read_edge_events(MAX_EVENTS)
+        print("Number of Events Pending ", len(noEvents))
+        return len(noEvents)
+
+    return 0
+
+
+# Function used to check the currently set function of the channel specified.
+# Param channel must be an integers. The function returns either IN, OUT,
+# or UNKNOWN
+def gpio_function(channel):
+    ch_info = _channel_to_info(channel)
+    func = _channel_configuration(ch_info)
+    if func is None:
+        func = UNKNOWN
+    return func
+
+
+class HW_PWM(object):
+    def __init__(self, channel, frequency_hz):
+        self._ch_info = _channel_to_info(channel, need_pwm=True)
+
+        app_cfg = _app_channel_configuration(self._ch_info)
+        if app_cfg == HARD_PWM:
+            raise ValueError("Can't create duplicate PWM objects")
+        # Apps typically set up channels as GPIO before making them be PWM,
+        # because RPi.GPIO does soft-PWM. We must undo the GPIO export to
+        # allow HW PWM to run on the pin.
+        if app_cfg in [IN, OUT]:
+            cleanup(channel)
+
+        if _gpio_warnings:
+            sysfs_cfg = channel_configuration(self._ch_info)
+            app_cfg = _app_channel_configuration(self._ch_info)
+
+            # warn if channel has been setup external to current program
+            if app_cfg is None and sysfs_cfg is not None:
+                warnings.warn(
+                    "This channel is already in use, continuing anyway. "
+                    "Use GPIO.setwarnings(False) to disable warnings",
+                    RuntimeWarning,
+                )
+
+        _export_pwm(self._ch_info)
+        self._started = False
+        _set_pwm_duty_cycle(self._ch_info, 0)
+        # Anything that doesn't match new frequency_hz
+        self._frequency_hz = -1 * frequency_hz
+        self._reconfigure(frequency_hz, 0.0)
+
+        _channel_configuration[channel] = HARD_PWM
+
+    def __del__(self):
+        if _channel_configuration.get(self._ch_info.channel, None) != HARD_PWM:
+            # The user probably ran cleanup() on the channel already, so avoid
+            # attempts to repeat the cleanup operations.
+            return
+        self.stop()
+        _unexport_pwm(self._ch_info)
+        del _channel_configuration[self._ch_info.channel]
+
+    def start(self, duty_cycle_percent):
+        self._reconfigure(self._frequency_hz, duty_cycle_percent, start=True)
+
+    def ChangeFrequency(self, frequency_hz):
+        self._reconfigure(frequency_hz, self._duty_cycle_percent)
+
+    def ChangeDutyCycle(self, duty_cycle_percent):
+        self._reconfigure(self._frequency_hz, duty_cycle_percent)
+
+    def stop(self):
+        if not self._started:
+            return
+        _disable_pwm(self._ch_info)
+
+    def _reconfigure(self, frequency_hz, duty_cycle_percent, start=False):
+        if duty_cycle_percent < 0.0 or duty_cycle_percent > 100.0:
+            raise ValueError("Invalid duty cycle.")
+
+        freq_change = start or (frequency_hz != self._frequency_hz)
+        stop = self._started and freq_change
+        if stop:
+            self._started = False
+            _disable_pwm(self._ch_info)
+
+        if freq_change:
+            self._frequency_hz = frequency_hz
+            self._period_ns = int(1000000000.0 / frequency_hz)
+            _set_pwm_period(self._ch_info, self._period_ns)
+
+        self._duty_cycle_percent = duty_cycle_percent
+        self._duty_cycle_ns = int(self._period_ns * (duty_cycle_percent / 100.0))
+
+        if stop or start:
+            _enable_pwm(self._ch_info)
+            self._started = True
+
+        _set_pwm_duty_cycle(self._ch_info, self._duty_cycle_ns)
+
+
+class SW_PWM(object):
+    def __init__(self, channel, frequency_hz):
+        self._init = False
+
+        # Check if the channel is already running as a PWM channel
+        if channel in _sw_pwm_channels:
+            raise ValueError("Channel %d already running as PWM." % (channel))
+
+        if frequency_hz <= 0.0:
+            raise ValueError("Invalid frequency")
+
+        self._ch_info = _channel_to_info(channel, need_pwm=False)
+
+        app_cfg = _app_channel_configuration(self._ch_info)
+
+        if _gpio_warnings:
+            sysfs_cfg = channel_configuration(self._ch_info)
+            app_cfg = _app_channel_configuration(self._ch_info)
+
+            # warn if channel has been setup external to current program
+            if app_cfg is not None and sysfs_cfg is not None:
+                warnings.warn(
+                    "This channel is already in use, continuing anyway. "
+                    "Use GPIO.setwarnings(False) to disable warnings",
+                    RuntimeWarning,
+                )
+
+        self._started = False
+        self._frequency_hz = frequency_hz
+        self._duty_cycle_percent = 0.0
+        self._basetime = 1000.0 / self._frequency_hz  # ms
+        self._slicetime = self._basetime / 100.0
+        self._stop_thread = False
+        self._calculate_times()
+        _channel_configuration[channel] = OUT
+        _sw_pwm_channels[channel] = True
+        self._init = True
+
+    def _print(self):
+        print("_frequency_hz       = ", self._frequency_hz)
+        print("_duty_cycle_percent = ", self._duty_cycle_percent)
+        print("_basetime           = ", self._basetime)
+        print("_slicetime          = ", self._slicetime)
+        print("_on_time            = ", self._on_time)
+        print("_off_time           = ", self._off_time)
+
+    def _calculate_times(self):
+        self._on_time = (self._duty_cycle_percent * self._slicetime) / 1000
+        self._off_time = ((100.0 - self._duty_cycle_percent) * self._slicetime) / 1000
+
+    def __del__(self):
+        if self._init:
+            self.stop()
+
+            if self._ch_info.channel in _sw_pwm_channels:
+                del _sw_pwm_channels[self._ch_info.channel]
+
+    def start(self, duty_cycle_percent):
+        if duty_cycle_percent < 0.0 or duty_cycle_percent > 100.0:
+            raise ValueError("Invalid duty cycle")
+
+        if not self._started:
+            # Create a new object. There is no restart support i.e. if you
+            # stop a thread then it cannot be started again.
+            self.thread = threading.Thread(target=self._pwm_device, args=())
+
+            # Start the thread
+            self.thread.start()
+
+    def _pwm_device(self):
+        self._started = True
+
+        while self._stop_thread == False:
+            GPIO.output(self._ch_info.channel, GPIO.HIGH)
+            time.sleep(self._on_time)
+
+            GPIO.output(self._ch_info.channel, GPIO.LOW)
+            time.sleep(self._off_time)
+
+        self._started = False
+
+    def ChangeFrequency(self, frequency_hz):
+        self._reconfigure(frequency_hz, self._duty_cycle_percent)
+
+    def ChangeDutyCycle(self, duty_cycle_percent):
+        self._reconfigure(self._frequency_hz, duty_cycle_percent)
+
+    def stop(self):
+        if self._started:
+            self._stop_thread = True
+            self.thread.join()
+
+    def _reconfigure(self, frequency_hz, duty_cycle_percent, start=False):
+        if duty_cycle_percent < 0.0 or duty_cycle_percent > 100.0:
+            raise ValueError("Invalid duty cycle")
+
+        freq_change = start or (frequency_hz != self._frequency_hz)
+        stop = self._started and freq_change
+        if stop:
+            self.stop()
+
+        if freq_change:
+            self._frequency_hz = frequency_hz
+            self._basetime = 1000.0 / self._frequency_hz
+
+        self._duty_cycle_percent = duty_cycle_percent
+        self._calculate_times()
+
+        if stop or start:
+            self.start(self._duty_cycle_percent)
+
+
+class PWM(object):
+    def __init__(self, channel, frequency_hz):
+        # Get the channel information and check if it has PWM
+        # directory information populated. The idea is that if
+        # it has a PWM directory information populated then it
+        # supports HW PWM functionality.
+        ch_info = _channel_to_info(channel, need_pwm=False)
+
+        if ch_info.pwm_chip_dir is not None:
+            self._pwm = HW_PWM(channel, frequency_hz)
+        else:
+            self._pwm = SW_PWM(channel, frequency_hz)
+
+    def __del__(self):
+        del self._pwm
+
+    def start(self, duty_cycle_percent):
+        self._pwm.start(duty_cycle_percent)
+
+    def ChangeFrequency(self, frequency_hz):
+        self._pwm.ChangeFrequency(frequency_hz)
+
+    def ChangeDutyCycle(self, duty_cycle_percent):
+        self._pwm.ChangeDutyCycle(duty_cycle_percent)
+
+    def stop(self):
+        self._pwm.stop()
+
+    def _reconfigure(self, frequency_hz, duty_cycle_percent, start=False):
+        self._pwm._reconfigure(frequency_hz, duty_cycle_percent, start)
